@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- pinch-zoom intentionally allowed (accessibility / WCAG 1.4.4) -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Workplace Flourishing research study" />
+  <title>What helps people flourish at work?</title>
+  <link rel="stylesheet" href="styles.css?v=5" />
+</head>
+<body>
+  <header id="progressHeader" class="progress-header" hidden>
+    <div class="progress-meta">
+      <span id="progressCount">Question 1 of 86</span>
+      <span id="progressMilestone" class="milestone"></span>
+      <span id="progressPct">0%</span>
+    </div>
+    <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+  </header>
+
+  <main id="app" class="app" aria-live="polite"></main>
+
+  <footer id="appFooter" class="app-footer">
+    <div id="saveStatus" class="save-status" aria-live="polite"></div>
+  </footer>
+
+  <!-- Config MUST load before the engine. ?v=5 forces a fresh (uncached) copy. -->
+  <script src="config.js?v=5"></script>
+  <script src="app.js?v=5"></script>
+</body>
+</html>
