@@ -316,6 +316,40 @@ const SURVEY_CONFIG = {
     id: "DILIGENCE",
     text: "I carefully read and answered all questions in this survey.",
     scale: "likert5_sdsa"
+  },
+
+  /* ====================================================================== *
+   *  ELIGIBILITY SCREENING (shown after the participant details screen)
+   *  Only "eligible: true" options may continue; others are terminated.
+   * ====================================================================== */
+  eligibility: {
+    question: "Which of the following best describes your current status?",
+    options: [
+      { label: "Salaried Employee (full-time or part-time)", eligible: true },
+      { label: "Student", eligible: false },
+      { label: "Business Owner / Self-Employed", eligible: false },
+      { label: "Other", eligible: false }
+    ]
+  },
+
+  /* ====================================================================== *
+   *  REFERRAL SYSTEM
+   *  surveyLink  -> the public URL participants share (UPDATE after deploy).
+   *  reward      -> one-time, paid once validReferrals reaches `threshold`.
+   * ====================================================================== */
+  referral: {
+    enabled: true,
+    surveyLink: "https://rachnaverma1203.github.io/flourishing-survey/",
+    rewardThreshold: 10,
+    rewardAmountText: "₹500",
+    messageTemplate:
+      "🌱 I recently participated in a research study on Workplace Flourishing and thought you might be interested.\n\n" +
+      "The study is looking for salaried employees and takes approximately 15 minutes to complete. " +
+      "As a token of appreciation, participants have a chance to win ₹1,000 through a lucky draw.\n\n" +
+      "If you participate, please use my referral ID:\n\n" +
+      "Referral ID: {REFERRAL_ID}\n" +
+      "Survey Link: {SURVEY_LINK}\n\n" +
+      "Thank you for supporting academic research!"
   }
 };
 

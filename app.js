@@ -1,21 +1,21 @@
 /* ============================================================================
- *  Workplace Flourishing Survey — app.js (the survey engine)
+ *  Workplace Flourishing Survey — app.js (engine, with eligibility + referrals)
  * ----------------------------------------------------------------------------
- *  Flow: Landing+Consent -> Participant -> items (one per screen, auto-advance)
- *        -> demographics (one per screen) -> submit -> thank-you
- *  - Mixed response scales, reverse keying, FAWS randomization
- *  - Mandatory by construction: selecting an answer auto-advances (~300ms);
- *    no Continue button on question screens. Back button always available.
- *  - No visible option numbers (values still stored internally for scoring).
- *  - Demographics harmonised with the printed paper form.
- *  - Accessible: radio groups, number-key + arrow shortcuts, focus management.
- *  - Local autosave + resume; section + final submission to Google Sheets.
+ *  Flow: Landing+Consent -> Participant (name, prize, "have a referral ID?")
+ *        -> Eligibility screen
+ *           - Salaried  -> items -> demographics -> submit -> thank-you (+referral tools)
+ *           - otherwise -> termination page (+referral tools)
+ *  - Server-assigned unique RF- referral IDs (reserve), valid-referral crediting
+ *    and dedup handled in Code.gs.
+ *  - Strict: a device may complete the survey only once.
  * ========================================================================== */
 (function () {
   "use strict";
 
   const CFG = window.SURVEY_CONFIG;
   const LS_KEY = "wfs_survey_state_v3";
+  const DONE_KEY = "wfs_device_done";
+  const MYREF_KEY = "wfs_my_ref";
   const ADVANCE_MS = 300;
 
   /* ----------------------------------------------------------------- utils */
@@ -33,32 +33,30 @@
     return node;
   };
   const uid = () => "R-" + Date.now().toString(36).toUpperCase() + "-" + Math.random().toString(36).slice(2, 7).toUpperCase();
-  function hashStr(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+  function hashStr(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0); }
   function mulberry32(a) { return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
   function seededShuffle(arr, seed) { const r = mulberry32(seed); const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 
   function detectDevice() {
     const ua = navigator.userAgent, w = window.screen.width, h = window.screen.height;
     let type = "desktop";
-    if (/Mobi|Android|iPhone|iPod/i.test(ua)) type = "mobile";
-    else if (/iPad|Tablet/i.test(ua)) type = "tablet";
+    if (/Mobi|Android|iPhone|iPod/i.test(ua)) type = "mobile"; else if (/iPad|Tablet/i.test(ua)) type = "tablet";
     let browser = "Unknown";
     if (/Edg\//.test(ua)) browser = "Edge"; else if (/OPR\//.test(ua)) browser = "Opera";
-    else if (/Chrome\//.test(ua)) browser = "Chrome"; else if (/Firefox\//.test(ua)) browser = "Firefox";
-    else if (/Safari\//.test(ua)) browser = "Safari";
-    return { deviceType: type, browser: browser, screen: w + "x" + h, viewport: window.innerWidth + "x" + window.innerHeight, userAgent: ua };
+    else if (/Chrome\//.test(ua)) browser = "Chrome"; else if (/Firefox\//.test(ua)) browser = "Firefox"; else if (/Safari\//.test(ua)) browser = "Safari";
+    let tz = ""; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) {}
+    const sig = "D" + hashStr([ua, w + "x" + h, tz, navigator.language || "", (navigator.platform || "")].join("|")).toString(36);
+    return { deviceType: type, browser: browser, screen: w + "x" + h, viewport: window.innerWidth + "x" + window.innerHeight, userAgent: ua, sig: sig };
   }
 
   /* ---------------------------------------------------------------- state */
   let state = loadState();
   function freshState() {
     return {
-      respondentId: uid(), seed: 0,
-      startedAt: new Date().toISOString(), startMs: Date.now(),
-      consent: false,
-      participant: { fullName: "", prizeOptIn: null, email: "", mobile: "" },
-      honeypot: "",
-      responses: {}, timing: {}, attention: {}, demographics: {}, diligence: null,
+      respondentId: uid(), seed: 0, startedAt: new Date().toISOString(), startMs: Date.now(),
+      consent: false, participant: { fullName: "", prizeOptIn: null, email: "", mobile: "" },
+      referredBy: "", referralId: "", eligibility: "", eligibleStatus: null,
+      honeypot: "", responses: {}, timing: {}, attention: {}, demographics: {}, diligence: null,
       screenIndex: 0, submitted: false, device: detectDevice()
     };
   }
@@ -66,6 +64,7 @@
   function saveState() { try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) {} flashSave(); }
   let saveTimer = null;
   function flashSave() { const s = $("#saveStatus"); if (!s) return; s.textContent = "Progress saved"; clearTimeout(saveTimer); saveTimer = setTimeout(() => { s.textContent = ""; }, 1300); }
+  function markDeviceDone() { try { localStorage.setItem(DONE_KEY, "1"); if (state.referralId) localStorage.setItem(MYREF_KEY, state.referralId); } catch (e) {} }
 
   /* ------------------------------------------------ build the screen list */
   let SCREENS = [], SCALE_ITEM_INDEX = {}, TOTAL_SCORED = 0, DEMO_INDEX = {};
@@ -73,10 +72,8 @@
     const screens = [];
     screens.push({ type: "welcome" });
     screens.push({ type: "participant" });
+    screens.push({ type: "eligibility" });
 
-    // Randomize ONLY within a construct. Items from different constructs are
-    // never intermixed. For FAWS (groupBy:"dim"), items are shuffled within
-    // each sub-dimension and the sub-dimensions stay grouped & in order.
     const stream = [];
     CFG.blocks.forEach((block, bi) => {
       let items = block.items.slice();
@@ -84,22 +81,14 @@
         const order = [], buckets = {};
         block.items.forEach((it) => { const k = it[block.groupBy]; if (!(k in buckets)) { buckets[k] = []; order.push(k); } buckets[k].push(it); });
         items = [];
-        order.forEach((k, gi) => {
-          const g = block.randomizeItems ? seededShuffle(buckets[k], state.seed + bi * 101 + gi) : buckets[k];
-          g.forEach((x) => items.push(x));
-        });
-      } else if (block.randomizeItems) {
-        items = seededShuffle(items, state.seed + bi);
-      }
+        order.forEach((k, gi) => { const g = block.randomizeItems ? seededShuffle(buckets[k], state.seed + bi * 101 + gi) : buckets[k]; g.forEach((x) => items.push(x)); });
+      } else if (block.randomizeItems) { items = seededShuffle(items, state.seed + bi); }
       items.forEach((it) => stream.push({ type: "item", blockId: block.id, instruction: block.instruction || null, item: it }));
     });
     const checksByPos = {};
     (CFG.attentionChecks || []).forEach((c) => { checksByPos[c.insertAfterScaleItem] = c; });
     let scored = 0;
-    stream.forEach((s) => {
-      screens.push(s); scored++; SCALE_ITEM_INDEX[s.item.id] = scored;
-      if (checksByPos[scored]) { screens.push({ type: "attention", check: checksByPos[scored] }); scored++; }
-    });
+    stream.forEach((s) => { screens.push(s); scored++; SCALE_ITEM_INDEX[s.item.id] = scored; if (checksByPos[scored]) { screens.push({ type: "attention", check: checksByPos[scored] }); scored++; } });
     TOTAL_SCORED = scored;
 
     CFG.demographics.forEach((d, i) => { DEMO_INDEX[d.id] = i + 1; screens.push({ type: "demo", demo: d }); });
@@ -114,9 +103,7 @@
     const header = $("#progressHeader");
     const show = screen.type === "item" || screen.type === "attention";
     header.hidden = !show; if (!show) return;
-    let pos = 0;
-    if (screen.type === "item") pos = SCALE_ITEM_INDEX[screen.item.id];
-    else if (screen.type === "attention") pos = screen.check.insertAfterScaleItem + 1;
+    let pos = screen.type === "item" ? SCALE_ITEM_INDEX[screen.item.id] : screen.check.insertAfterScaleItem + 1;
     const pct = Math.round((pos / TOTAL_SCORED) * 100);
     $("#progressCount").textContent = "Question " + pos + " of " + TOTAL_SCORED;
     $("#progressPct").textContent = pct + "%";
@@ -129,11 +116,7 @@
   function clearKeys() { if (keyHandler) { document.removeEventListener("keydown", keyHandler); keyHandler = null; } }
   function bindKeys(maxN, selectFn) {
     clearKeys();
-    keyHandler = function (e) {
-      if (e.target && /INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) return;
-      const n = parseInt(e.key, 10);
-      if (!isNaN(n) && n >= 1 && n <= maxN) selectFn(n);
-    };
+    keyHandler = function (e) { if (e.target && /INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) return; const n = parseInt(e.key, 10); if (!isNaN(n) && n >= 1 && n <= maxN) selectFn(n); };
     document.addEventListener("keydown", keyHandler);
   }
 
@@ -145,19 +128,18 @@
     updateProgress(screen);
     const app = $("#app"); app.innerHTML = ""; screenShownAt = Date.now();
     const node = ({
-      welcome: renderWelcome, participant: renderParticipant,
+      welcome: renderWelcome, participant: renderParticipant, eligibility: renderEligibility,
       item: renderItem, attention: renderAttention, demo: renderDemo,
       submit: renderSubmit, thankyou: renderThankYou
     })[screen.type](screen);
     app.appendChild(el("div", { class: "screen" }, [node]));
     window.scrollTo(0, 0);
   }
+  function paint(node) { const app = $("#app"); app.innerHTML = ""; app.appendChild(el("div", { class: "screen" }, [node])); window.scrollTo(0, 0); }
   function go(delta) { const next = state.screenIndex + delta; if (next < 0 || next >= SCREENS.length) return; state.screenIndex = next; saveState(); render(); }
 
-  /* -------- reusable auto-advancing choice screen -------- */
+  /* -------- auto-advancing choice card -------- */
   function choiceCard(opts) {
-    // opts: { eyebrow, instruction, text, labels, getValue(val->bool by index+1),
-    //         isSelected(i), onChoose(i, advance), showBack }
     const group = el("div", { class: "options", role: "radiogroup" });
     group.setAttribute("aria-label", opts.text);
     let advancing = false;
@@ -165,7 +147,6 @@
       if (advancing) return;
       Array.prototype.forEach.call(group.children, (o, idx) => { const on = idx === i; o.classList.toggle("selected", on); o.setAttribute("aria-checked", on ? "true" : "false"); });
       advancing = true; clearKeys();
-      // gently fade the current screen out during the advance delay
       const scr = $("#app .screen"); if (scr) scr.classList.add("leaving");
       opts.onChoose(i, () => setTimeout(() => go(1), ADVANCE_MS));
     }
@@ -173,8 +154,7 @@
       const sel = opts.isSelected(i);
       const opt = el("button", { class: "option" + (sel ? " selected" : ""), type: "button", role: "radio" });
       opt.setAttribute("aria-checked", sel ? "true" : "false");
-      opt.appendChild(el("span", { class: "dot" }));
-      opt.appendChild(el("span", null, [label]));
+      opt.appendChild(el("span", { class: "dot" })); opt.appendChild(el("span", null, [label]));
       opt.addEventListener("click", () => choose(i));
       group.appendChild(opt);
     });
@@ -195,60 +175,56 @@
     const cb = el("input", { type: "checkbox", id: "consentBox" }); cb.checked = !!state.consent;
     const beginBtn = el("button", { class: "btn btn-primary", disabled: !state.consent, onclick: () => { if (cb.checked) { state.consent = true; saveState(); go(1); } } }, ["Begin"]);
     cb.addEventListener("change", () => { state.consent = cb.checked; beginBtn.disabled = !cb.checked; });
-
     const cards = el("div", { class: "info-grid" }, [
       el("div", { class: "info-card" }, [el("div", { class: "ic" }, ["⏱️"]), el("div", { class: "it" }, ["About " + CFG.study.estimatedMinutes + " minutes"]), el("div", { class: "id" }, ["One short question at a time."])]),
       el("div", { class: "info-card" }, [el("div", { class: "ic" }, ["🔒"]), el("div", { class: "it" }, ["Confidential"]), el("div", { class: "id" }, ["Your answers are anonymous and used only for research."])]),
       el("div", { class: "info-card" }, [el("div", { class: "ic" }, ["✋"]), el("div", { class: "it" }, ["Voluntary"]), el("div", { class: "id" }, ["You can stop at any time."])]),
-      el("div", { class: "info-card" }, [el("div", { class: "ic" }, ["🎓"]), el("div", { class: "it" }, ["Academic study"]), el("div", { class: "id" }, [r.institution])])
+      el("div", { class: "info-card" }, [el("div", { class: "ic" }, ["👔"]), el("div", { class: "it" }, ["Salaried employees"]), el("div", { class: "id" }, ["This study is for salaried employees."])])
     ]);
-
     const researcher = el("div", { class: "researcher-card" }, [
       el("div", { class: "rc-label" }, ["Conducted by"]),
       el("div", { class: "rc-name" }, [r.name]),
       el("div", { class: "rc-sub" }, [(r.designation ? r.designation + " · " : "") + r.institution]),
       el("a", { class: "rc-email", href: "mailto:" + r.email }, [r.email])
     ]);
-
     const kids = [
       el("span", { class: "hero-badge" }, ["Research Study"]),
       el("h1", { class: "hero-title" }, [CFG.study.title]),
       el("p", { class: "hero-sub" }, [CFG.study.subtitle + " Your honest answers will help researchers better understand well-being at work."]),
       cards
     ];
-    if (CFG.incentive && CFG.incentive.enabled) {
-      kids.push(el("div", { class: "prize-banner" }, [
-        el("div", { class: "pe" }, ["🎁"]),
-        el("div", null, [el("div", { class: "pt" }, [CFG.incentive.headline]), el("div", { class: "pd" }, [CFG.incentive.short + " Optional — we'll ask on the next screen."])])
-      ]));
-    }
+    if (CFG.incentive && CFG.incentive.enabled) kids.push(el("div", { class: "prize-banner" }, [el("div", { class: "pe" }, ["🎁"]), el("div", null, [el("div", { class: "pt" }, [CFG.incentive.headline]), el("div", { class: "pd" }, [CFG.incentive.short + " Optional — we'll ask on the next screen."])])]));
     kids.push(researcher);
     kids.push(el("label", { class: "consent-check" }, [cb, el("span", null, ["I am 18 or older and I agree to take part in this study."])]));
     kids.push(el("div", { class: "nav" }, [beginBtn]));
     return el("div", { class: "card" }, kids);
   }
 
-  /* -------- Participant info -------- */
+  /* -------- Participant info (+ referral ID) -------- */
   function renderParticipant() {
     const p = state.participant;
     const nameInput = el("input", { type: "text", id: "fullName", value: p.fullName || "", placeholder: "Your full name", autocomplete: "name" });
-    const nameErr = el("div", { class: "error-text", id: "nameErr" }); nameErr.style.display = "none";
+    const nameErr = el("div", { class: "error-text" }); nameErr.style.display = "none";
     const hp = el("input", { type: "text", class: "hp", tabindex: "-1", autocomplete: "off", value: state.honeypot || "" });
     const contactWrap = el("div", { id: "contactWrap" });
+    const refWrap = el("div", { id: "refWrap" });
     const continueBtn = el("button", { class: "btn btn-primary", disabled: true }, ["Continue"]);
+
+    let hasRef = state.referredBy ? true : (state._hasRefAnswered ? false : null);
 
     function valid() {
       if (!nameInput.value.trim()) return false;
       if (p.prizeOptIn == null) return false;
       if (p.prizeOptIn === true) {
         const email = $("#email", contactWrap), mob = $("#mobile", contactWrap);
-        const okEmail = email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.value.trim());
-        const okMob = mob && mob.value.replace(/\D/g, "").length >= 7;
-        if (!okEmail || !okMob) return false;
+        if (!(email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.value.trim()))) return false;
+        if (!(mob && mob.value.replace(/\D/g, "").length >= 7)) return false;
       }
+      if (hasRef == null) return false;                  // must answer yes/no
       return true;
     }
     function refresh() { continueBtn.disabled = !valid(); }
+
     function renderContact() {
       contactWrap.innerHTML = "";
       if (p.prizeOptIn === true) {
@@ -264,15 +240,42 @@
     const noBtn = el("button", { class: "option" + (p.prizeOptIn === false ? " selected" : ""), type: "button" }, [el("span", { class: "dot" }), el("span", null, ["No, thanks"])]);
     function setOpt(v) { p.prizeOptIn = v; yesBtn.classList.toggle("selected", v === true); noBtn.classList.toggle("selected", v === false); renderContact(); saveState(); }
     yesBtn.addEventListener("click", () => setOpt(true)); noBtn.addEventListener("click", () => setOpt(false));
-    nameInput.addEventListener("input", () => { nameErr.style.display = "none"; refresh(); });
-    renderContact();
 
-    continueBtn.addEventListener("click", () => {
-      if (!valid()) return;
+    function renderRef() {
+      refWrap.innerHTML = "";
+      const ry = el("button", { class: "option" + (hasRef === true ? " selected" : ""), type: "button" }, [el("span", { class: "dot" }), el("span", null, ["Yes"])]);
+      const rn = el("button", { class: "option" + (hasRef === false ? " selected" : ""), type: "button" }, [el("span", { class: "dot" }), el("span", null, ["No"])]);
+      ry.addEventListener("click", () => { hasRef = true; state._hasRefAnswered = true; drawRefField(); refresh(); });
+      rn.addEventListener("click", () => { hasRef = false; state._hasRefAnswered = true; state.referredBy = ""; drawRefField(); saveState(); refresh(); });
+      refWrap.appendChild(el("label", null, ["Do you have a referral ID?"]));
+      refWrap.appendChild(el("div", { class: "choice-row" }, [ry, rn]));
+      const fieldHolder = el("div", { id: "refFieldHolder" }); refWrap.appendChild(fieldHolder);
+      function drawRefField() {
+        ry.classList.toggle("selected", hasRef === true); rn.classList.toggle("selected", hasRef === false);
+        fieldHolder.innerHTML = "";
+        if (hasRef === true) {
+          const inp = el("input", { type: "text", id: "refIdInput", value: state.referredBy || "", placeholder: "e.g. RF-1042 (optional)" });
+          inp.addEventListener("input", () => { state.referredBy = inp.value.trim().toUpperCase(); saveState(); });
+          fieldHolder.appendChild(el("div", { class: "field" }, [el("label", null, ["Referral ID ", el("span", { class: "muted-note" }, ["(optional)"])]), inp]));
+        }
+      }
+      drawRefField();
+    }
+
+    nameInput.addEventListener("input", () => { nameErr.style.display = "none"; refresh(); });
+    renderContact(); renderRef();
+
+    let working = false;
+    continueBtn.addEventListener("click", async () => {
+      if (!valid() || working) return;
       p.fullName = nameInput.value.trim(); state.honeypot = hp.value;
       if (p.prizeOptIn === true) { p.email = $("#email", contactWrap).value.trim(); p.mobile = $("#mobile", contactWrap).value.trim(); }
       else { p.email = ""; p.mobile = ""; }
-      saveState(); flushPartial("participant"); go(1);
+      saveState();
+      working = true; continueBtn.disabled = true; continueBtn.textContent = "Please wait…";
+      await reserveReferral();              // assign this person's RF- ID
+      flushPartial("participant");
+      go(1);                                // -> eligibility screen
     });
 
     return el("div", { class: "card" }, [
@@ -282,12 +285,46 @@
       hp,
       el("div", { class: "field" }, [el("label", null, ["Would you like to be entered into the optional ₹1,000 thank-you draw?"]), el("div", { class: "choice-row" }, [yesBtn, noBtn])]),
       contactWrap,
-      el("p", { class: "muted-note" }, ["If you enter, your contact details are kept separate from your answers and used only for the draw."]),
+      el("div", { class: "field" }, [refWrap]),
+      el("p", { class: "muted-note" }, ["A referral ID is only if someone invited you — otherwise choose No. Contact details (if given) are kept separate and used only for the draw."]),
       el("div", { class: "nav" }, [el("button", { class: "btn-back", onclick: () => go(-1) }, ["← Back"]), continueBtn])
     ]);
   }
 
-  /* -------- Item / Attention (auto-advance, no numbers) -------- */
+  /* -------- Eligibility screening -------- */
+  function renderEligibility() {
+    const opts = CFG.eligibility.options;
+    const group = el("div", { class: "options", role: "radiogroup" });
+    group.setAttribute("aria-label", CFG.eligibility.question);
+    let advancing = false;
+    function choose(i) {
+      if (advancing) return;
+      const o = opts[i];
+      Array.prototype.forEach.call(group.children, (n, idx) => { const on = idx === i; n.classList.toggle("selected", on); n.setAttribute("aria-checked", on ? "true" : "false"); });
+      advancing = true; clearKeys();
+      state.eligibility = o.label; state.eligibleStatus = !!o.eligible; saveState();
+      const scr = $("#app .screen"); if (scr) scr.classList.add("leaving");
+      if (o.eligible) { setTimeout(() => go(1), ADVANCE_MS); }
+      else { submitIneligible(); setTimeout(() => paint(renderTerminate()), ADVANCE_MS); }
+    }
+    opts.forEach((o, i) => {
+      const sel = state.eligibility === o.label;
+      const opt = el("button", { class: "option" + (sel ? " selected" : ""), type: "button", role: "radio" });
+      opt.setAttribute("aria-checked", sel ? "true" : "false");
+      opt.appendChild(el("span", { class: "dot" })); opt.appendChild(el("span", null, [o.label]));
+      opt.addEventListener("click", () => choose(i));
+      group.appendChild(opt);
+    });
+    bindKeys(opts.length, (n) => choose(n - 1));
+    return el("div", { class: "card" }, [
+      el("p", { class: "eyebrow" }, ["One quick check"]),
+      el("p", { class: "q-text", tabindex: "-1" }, [CFG.eligibility.question]),
+      group,
+      el("div", { class: "nav" }, [el("button", { class: "btn-back", onclick: () => go(-1) }, ["← Back"])])
+    ]);
+  }
+
+  /* -------- Item / Attention / Demographics -------- */
   function renderItem(s) {
     const it = s.item, sc = CFG.responseScales[it.scale];
     return choiceCard({
@@ -304,25 +341,17 @@
       onChoose: (i, advance) => { state.attention[c.id] = i + 1; state.timing[c.id] = Date.now() - screenShownAt; saveState(); flushPartial("attention"); advance(); }
     });
   }
-
-  /* -------- Demographics: one per screen (cards auto-advance, text + Continue) -------- */
   function renderDemo(s) {
-    const d = s.demo, pos = DEMO_INDEX[d.id], total = CFG.demographics.length;
-    const eyebrow = "About you · " + pos + " of " + total;
+    const d = s.demo, pos = DEMO_INDEX[d.id], total = CFG.demographics.length, eyebrow = "About you · " + pos + " of " + total;
     if (d.type === "text") {
-      const input = el("input", { type: "text", id: "demo_" + d.id, value: state.demographics[d.id] || "", placeholder: "Type your answer", autocomplete: "organization-title" });
+      const input = el("input", { type: "text", id: "demo_" + d.id, value: state.demographics[d.id] || "", placeholder: "Type your answer" });
       const nextBtn = el("button", { class: "btn btn-primary", disabled: !(state.demographics[d.id] || "").trim() }, ["Continue"]);
-      function commitAndGo() { const v = input.value.trim(); if (!v) return; state.demographics[d.id] = v; saveState(); go(1); }
+      function commit() { const v = input.value.trim(); if (!v) return; state.demographics[d.id] = v; saveState(); go(1); }
       input.addEventListener("input", () => { state.demographics[d.id] = input.value; nextBtn.disabled = !input.value.trim(); saveState(); });
-      input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commitAndGo(); } });
-      nextBtn.addEventListener("click", commitAndGo);
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } });
+      nextBtn.addEventListener("click", commit);
       setTimeout(() => { try { input.focus(); } catch (e) {} }, 0);
-      return el("div", { class: "card" }, [
-        el("p", { class: "eyebrow" }, [eyebrow]),
-        el("p", { class: "q-text" }, [d.label]),
-        el("div", { class: "field" }, [input]),
-        el("div", { class: "nav" }, [el("button", { class: "btn-back", onclick: () => go(-1) }, ["← Back"]), nextBtn])
-      ]);
+      return el("div", { class: "card" }, [el("p", { class: "eyebrow" }, [eyebrow]), el("p", { class: "q-text" }, [d.label]), el("div", { class: "field" }, [input]), el("div", { class: "nav" }, [el("button", { class: "btn-back", onclick: () => go(-1) }, ["← Back"]), nextBtn])]);
     }
     return choiceCard({
       eyebrow: eyebrow, text: d.label, labels: d.options, showBack: true,
@@ -331,22 +360,62 @@
     });
   }
 
-  /* -------- Submit + Thank-you -------- */
+  /* -------- Submit + Thank-you + Terminate + Blocked -------- */
   function renderSubmit() {
     const statusBox = el("p", { class: "muted-note" }, ["Saving your responses…"]);
-    const card = el("div", { class: "card center" }, [el("div", { class: "big-emoji" }, ["⏳"]), el("p", { class: "q-text" }, ["Finishing up"]), statusBox]);
     submitFinal(statusBox);
-    return card;
+    return el("div", { class: "card center" }, [el("div", { class: "big-emoji" }, ["⏳"]), el("p", { class: "q-text" }, ["Finishing up"]), statusBox]);
   }
   function renderThankYou() {
-    const r = CFG.study.researcher;
     return el("div", { class: "card center" }, [
-      el("div", { class: "big-emoji" }, ["🌳"]),
-      el("h1", { class: "q-text" }, ["Thank you."]),
+      el("div", { class: "big-emoji" }, ["🎉"]),
+      el("h1", { class: "q-text" }, ["Thank you for participating!"]),
       el("p", { class: "lead" }, ["Your responses have been successfully recorded."]),
-      el("p", { class: "muted-note" }, ["If you entered the draw, we'll use your contact details only to notify winners."]),
-      el("p", { class: "muted-note" }, [r.name + " · " + (r.designation ? r.designation + ", " : "") + r.institution + " · ", el("a", { class: "rc-email", href: "mailto:" + r.email }, [r.email])])
+      referralToolsNode("You can also support this research by sharing it with other salaried employees.")
     ]);
+  }
+  function renderTerminate() {
+    return el("div", { class: "card center" }, [
+      el("div", { class: "big-emoji" }, ["🙏"]),
+      el("h1", { class: "q-text" }, ["Thank you!"]),
+      el("p", { class: "lead" }, ["At this time, this study is specifically looking for responses from salaried employees, so you are not eligible to take part directly."]),
+      el("p", { class: "muted-note" }, ["You can still support this research by sharing it with friends, family, or colleagues who are salaried employees."]),
+      referralToolsNode(null)
+    ]);
+  }
+  function renderBlocked() {
+    const ref = (function () { try { return localStorage.getItem(MYREF_KEY) || ""; } catch (e) { return ""; } })();
+    const kids = [el("div", { class: "big-emoji" }, ["✅"]), el("h1", { class: "q-text" }, ["Already completed"]), el("p", { class: "lead" }, ["This device has already been used to complete the survey. Thank you!"])];
+    if (ref) kids.push(referralToolsNode("You can still share the study using your referral ID.", ref));
+    return el("div", { class: "card center" }, kids);
+  }
+
+  /* -------- Referral tools (copy/share) -------- */
+  function referralMessage(refId) {
+    return CFG.referral.messageTemplate.replace(/\{REFERRAL_ID\}/g, refId || "").replace(/\{SURVEY_LINK\}/g, CFG.referral.surveyLink || "");
+  }
+  function copyText(t, btn) {
+    const ok = () => { const o = btn.textContent; btn.textContent = "Copied ✓"; setTimeout(() => { btn.textContent = o; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(ok, () => fallbackCopy(t, ok));
+    else fallbackCopy(t, ok);
+  }
+  function fallbackCopy(t, ok) { const ta = el("textarea", null, [t]); ta.style.position = "fixed"; ta.style.left = "-9999px"; document.body.appendChild(ta); ta.select(); try { document.execCommand("copy"); } catch (e) {} document.body.removeChild(ta); ok && ok(); }
+  function referralToolsNode(intro, overrideRef) {
+    const refId = overrideRef || state.referralId || "";
+    if (!CFG.referral || CFG.referral.enabled === false) return el("div");
+    const msg = referralMessage(refId);
+    const box = el("div", { class: "referral-box" }, []);
+    if (intro) box.appendChild(el("p", { class: "muted-note", style: "margin-top:0" }, [intro]));
+    box.appendChild(el("div", { class: "ref-reward" }, ["🎁 If at least " + CFG.referral.rewardThreshold + " valid, completed responses are received using your referral ID, you'll receive an assured reward of " + CFG.referral.rewardAmountText + "."]));
+    box.appendChild(el("div", { class: "ref-id-label" }, ["Your Referral ID"]));
+    box.appendChild(el("div", { class: "ref-id" }, [refId || "—"]));
+    const copyId = el("button", { class: "btn btn-ghost ref-btn", onclick: () => copyText(refId, copyId) }, ["Copy Referral ID"]);
+    const copyMsg = el("button", { class: "btn btn-ghost ref-btn", onclick: () => copyText(msg, copyMsg) }, ["Copy Message"]);
+    const wa = el("a", { class: "btn btn-primary ref-btn", href: "https://wa.me/?text=" + encodeURIComponent(msg), target: "_blank", rel: "noopener" }, ["Share via WhatsApp"]);
+    const em = el("a", { class: "btn btn-ghost ref-btn", href: "mailto:?subject=" + encodeURIComponent("A research study you might be interested in") + "&body=" + encodeURIComponent(msg) }, ["Share via Email"]);
+    box.appendChild(el("div", { class: "ref-actions" }, [copyId, copyMsg, wa, em]));
+    box.appendChild(el("details", { class: "ref-preview" }, [el("summary", null, ["Preview message"]), el("pre", null, [msg])]));
+    return box;
   }
 
   /* --------------------------------------------------- scoring & quality */
@@ -354,11 +423,7 @@
     const byConstruct = {};
     CFG.blocks.forEach((block) => {
       const vals = [];
-      block.items.forEach((it) => {
-        let v = state.responses[it.id]; if (v == null) return;
-        if (it.reverse) { const max = CFG.responseScales[it.scale].anchors.length; v = (max + 1) - v; }
-        vals.push(v);
-      });
+      block.items.forEach((it) => { let v = state.responses[it.id]; if (v == null) return; if (it.reverse) { const max = CFG.responseScales[it.scale].anchors.length; v = (max + 1) - v; } vals.push(v); });
       if (vals.length) { const sum = vals.reduce((a, b) => a + b, 0); byConstruct[block.construct] = { sum: sum, mean: +(sum / vals.length).toFixed(3), n: vals.length }; }
     });
     return byConstruct;
@@ -369,9 +434,8 @@
     const rawSeq = orderedIds.map((id) => state.responses[id]).filter((v) => v != null);
     let longest = 0, run = 0, prev = null;
     rawSeq.forEach((v) => { if (v === prev) run++; else { run = 1; prev = v; } if (run > longest) longest = run; });
-    const all = rawSeq.slice();
-    const mean = all.length ? all.reduce((a, b) => a + b, 0) / all.length : 0;
-    const sd = all.length ? Math.sqrt(all.reduce((a, b) => a + (b - mean) * (b - mean), 0) / all.length) : 0;
+    const mean = rawSeq.length ? rawSeq.reduce((a, b) => a + b, 0) / rawSeq.length : 0;
+    const sd = rawSeq.length ? Math.sqrt(rawSeq.reduce((a, b) => a + (b - mean) * (b - mean), 0) / rawSeq.length) : 0;
     const times = Object.values(state.timing).map((m) => m / 1000).filter((x) => x > 0); times.sort((a, b) => a - b);
     const medianTime = times.length ? times[Math.floor(times.length / 2)] : 0;
     const tooFast = times.filter((t) => t < q.minSecondsPerItem).length;
@@ -395,10 +459,9 @@
     return {
       startTime: state.startedAt, endTime: new Date().toISOString(), totalSeconds: totalSeconds,
       medianSecondsPerItem: +medianTime.toFixed(2), tooFastCount: tooFast, tooFastProportion: +tooFastProp.toFixed(3),
-      longestStraightLine: longest, responseSD: +sd.toFixed(3),
-      attentionScore: attScore, attentionTotal: totalChecks, attentionDetail: attDetail,
-      diligenceSelfReport: state.diligence, itemsAnswered: answered, itemsExpected: expected,
-      complete: complete, honeypotTriggered: !!state.honeypot, qualityScore: score, prizeEligible: eligible, device: state.device
+      longestStraightLine: longest, responseSD: +sd.toFixed(3), attentionScore: attScore, attentionTotal: totalChecks, attentionDetail: attDetail,
+      diligenceSelfReport: state.diligence, itemsAnswered: answered, itemsExpected: expected, complete: complete,
+      honeypotTriggered: !!state.honeypot, qualityScore: score, prizeEligible: eligible, device: state.device
     };
   }
 
@@ -407,18 +470,32 @@
     return {
       action: action, sharedSecret: (CFG.backend && CFG.backend.sharedSecret) || "",
       respondentId: state.respondentId, seed: state.seed, consent: state.consent,
-      participant: state.participant, responses: state.responses, attention: state.attention,
-      demographics: state.demographics, diligence: state.diligence, timing: state.timing,
-      scores: computeScores(), quality: computeQuality()
+      participant: state.participant, referralId: state.referralId, referredBy: state.referredBy,
+      eligibility: state.eligibility, eligibleStatus: state.eligibleStatus === true,
+      deviceSig: state.device && state.device.sig,
+      responses: state.responses, attention: state.attention, demographics: state.demographics,
+      diligence: state.diligence, timing: state.timing, scores: computeScores(), quality: computeQuality()
     };
   }
   function backendConfigured() { return CFG.backend && CFG.backend.appsScriptUrl && /^https?:\/\//.test(CFG.backend.appsScriptUrl); }
   async function postToBackend(payload) {
-    if (!backendConfigured()) { console.log("[DEMO MODE] would send:", payload.action, payload.respondentId); return { ok: true, demo: true }; }
+    if (!backendConfigured()) { console.log("[DEMO MODE]", payload.action, payload.respondentId); return { ok: true, demo: true }; }
     const res = await fetch(CFG.backend.appsScriptUrl, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(payload) });
     return res.json().catch(() => ({ ok: res.ok }));
   }
+  async function reserveReferral() {
+    if (state.referralId) return state.referralId;
+    if (backendConfigured()) {
+      try {
+        const r = await postToBackend({ action: "reserve", sharedSecret: (CFG.backend && CFG.backend.sharedSecret) || "", respondentId: state.respondentId, participant: state.participant, referredBy: state.referredBy, deviceSig: state.device && state.device.sig });
+        if (r && r.referralId) { state.referralId = r.referralId; saveState(); return r.referralId; }
+      } catch (e) {}
+    }
+    state.referralId = state.referralId || ("RF-LOCAL-" + String(hashStr(state.respondentId)).slice(0, 4));
+    saveState(); return state.referralId;
+  }
   function flushPartial(phase) { try { const payload = buildPayload("save"); payload.phase = phase; postToBackend(payload).catch(() => {}); } catch (e) {} }
+  function submitIneligible() { try { state.submitted = true; saveState(); markDeviceDone(); postToBackend(buildPayload("submit")).catch(() => {}); try { localStorage.removeItem(LS_KEY); } catch (e) {} } catch (e) {} }
   async function submitFinal(statusBox) {
     state.submitted = true; saveState();
     const payload = buildPayload("submit"); let ok = false;
@@ -427,6 +504,7 @@
       if (!ok) await new Promise((res) => setTimeout(res, 1200));
     }
     if (statusBox) statusBox.textContent = ok ? "Saved." : "Saved on this device.";
+    markDeviceDone();
     if (ok && backendConfigured()) { try { localStorage.removeItem(LS_KEY); } catch (e) {} }
     setTimeout(() => go(1), 600);
   }
@@ -434,7 +512,11 @@
   /* ------------------------------------------------------------- boot up */
   function boot() {
     if (!CFG) { $("#app").innerHTML = "<div class='card'>Configuration not loaded. Please check config.js.</div>"; return; }
-    const resuming = !!(state && !state.submitted && (Object.keys(state.responses).length > 0 || state.consent));
+    const inProgress = loadState();
+    let deviceDone = false; try { deviceDone = localStorage.getItem(DONE_KEY) === "1"; } catch (e) {}
+    if (deviceDone && !inProgress) { state = freshState(); paint(renderBlocked()); return; }   // strict: one per device
+
+    const resuming = !!(inProgress && !inProgress.submitted && (Object.keys(inProgress.responses).length > 0 || inProgress.consent));
     if (!state) state = freshState();
     if (!state.seed) state.seed = hashStr(state.respondentId);
     state.device = detectDevice();
@@ -442,16 +524,15 @@
     if (state.screenIndex >= SCREENS.length) state.screenIndex = 0;
     saveState();
     if (resuming && state.screenIndex > 1) {
-      $("#app").innerHTML = "";
-      $("#app").appendChild(el("div", { class: "screen" }, [el("div", { class: "card center" }, [
+      paint(el("div", { class: "card center" }, [
         el("div", { class: "big-emoji" }, ["↩️"]),
         el("h1", { class: "q-text" }, ["Welcome back"]),
         el("p", { class: "lead" }, ["You have a survey in progress on this device. Continue where you left off?"]),
         el("div", { class: "nav" }, [
-          el("button", { class: "btn-back", onclick: () => { localStorage.removeItem(LS_KEY); state = freshState(); state.seed = hashStr(state.respondentId); SCREENS = buildScreens(); saveState(); render(); } }, ["Start over"]),
+          el("button", { class: "btn-back", onclick: () => { try { localStorage.removeItem(LS_KEY); } catch (e) {} state = freshState(); state.seed = hashStr(state.respondentId); SCREENS = buildScreens(); saveState(); render(); } }, ["Start over"]),
           el("button", { class: "btn btn-primary", onclick: () => render() }, ["Continue"])
         ])
-      ])]));
+      ]));
     } else { render(); }
   }
   window.addEventListener("beforeunload", function (e) { if (state && !state.submitted && Object.keys(state.responses).length > 0) { e.preventDefault(); e.returnValue = ""; } });

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Check your referral count</title>
+  <link rel="stylesheet" href="styles.css?v=6" />
+</head>
+<body>
+  <main id="app" class="app">
+    <div class="card">
+      <p class="eyebrow">Referral status</p>
+      <h1 class="q-text">Check your referrals</h1>
+      <p class="lead">Enter your referral ID to see how many valid, completed responses have used it so far.</p>
+      <div class="field">
+        <label for="rid">Referral ID</label>
+        <input type="text" id="rid" placeholder="e.g. RF-1042" autocomplete="off" />
+      </div>
+      <div class="nav"><button id="check" class="btn btn-primary">Check status</button></div>
+      <div id="out" style="margin-top:18px"></div>
+    </div>
+  </main>
+  <script src="config.js?v=6"></script>
+  <script>
+  (function () {
+    var CFG = window.SURVEY_CONFIG || {};
+    var out = document.getElementById("out");
+    var btn = document.getElementById("check");
+    function row(label, value, strong) {
+      return '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e2e7ef">' +
+        '<span style="color:#56616f">' + label + '</span><span style="font-weight:' + (strong ? 800 : 600) + '">' + value + '</span></div>';
+    }
+    async function check() {
+      var id = (document.getElementById("rid").value || "").trim().toUpperCase();
+      out.innerHTML = "";
+      if (!/^RF-/.test(id)) { out.innerHTML = '<p class="error-text">Please enter a valid referral ID (it starts with RF-).</p>'; return; }
+      if (!CFG.backend || !/^https?:\/\//.test(CFG.backend.appsScriptUrl || "")) { out.innerHTML = '<p class="error-text">Lookup is only available on the live (published) site.</p>'; return; }
+      btn.disabled = true; btn.textContent = "Checking…";
+      try {
+        var res = await fetch(CFG.backend.appsScriptUrl, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ action: "lookup", sharedSecret: CFG.backend.sharedSecret, referralId: id }) });
+        var d = await res.json();
+        if (!d || d.found === false) { out.innerHTML = '<p class="error-text">No referrals found for that ID yet. Double-check the ID.</p>'; }
+        else {
+          var threshold = d.threshold || 10;
+          var reward = (d.rewardEligible === "Yes") ? "🎉 Reward unlocked!" : ("Keep going — " + Math.max(0, threshold - (d.validReferrals || 0)) + " more valid to unlock " + (CFG.referral ? CFG.referral.rewardAmountText : "₹500"));
+          out.innerHTML = '<div class="referral-box">' +
+            row("Referral ID", d.referralId, true) +
+            row("Valid referrals", (d.validReferrals || 0) + " / " + threshold, true) +
+            row("Total referrals", (d.totalReferrals || 0)) +
+            row("Invalid / pending", (d.invalidReferrals || 0)) +
+            row("Reward status", reward) +
+            row("Payment", d.paymentStatus || "Pending") + '</div>';
+        }
+      } catch (e) { out.innerHTML = '<p class="error-text">Could not reach the server. Please try again.</p>'; }
+      btn.disabled = false; btn.textContent = "Check status";
+    }
+    btn.addEventListener("click", check);
+    document.getElementById("rid").addEventListener("keydown", function (e) { if (e.key === "Enter") check(); });
+  })();
+  </script>
+</body>
+</html>
